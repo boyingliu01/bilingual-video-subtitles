@@ -44,16 +44,25 @@ start/end 后 render，无需重跑流水线。
 ## 渲染阶段（render）
 
 **字幕显示方块/乱码**
-缺 CJK 字体。Linux 装 `fonts-noto-cjk`（ASS 用 Noto Sans CJK SC），Windows 确认
-`C:\Windows\Fonts` 下有微软雅黑/黑体/宋体（ASS 自动切 Microsoft YaHei）后重渲染。
+libass 按字体族名匹配，探测不到会静默渲染豆腐块。pipeline 已按平台自动探测：
+macOS 优先 PingFang SC（系统自带）→ Hiragino Sans GB → STHeiti；Windows 优先
+微软雅黑；Linux 优先 Noto Sans CJK SC（缺失时装 `fonts-noto-cjk` 或
+`brew install font-noto-sans-cjk-sc` 后重渲染）。
 
 **渲染进程中断**
-本沙箱会清理后台长任务——务必前台运行。已完成部分不会自动续渲，
+后台长任务可能被环境清理——务必前台运行。已完成部分不会自动续渲，
 删除输出 mp4 后重跑 build（前面阶段全部命中缓存，只重渲染）。
 
-**输出文件过大**
-默认 crf=22；源视频码率很低（录屏类）时可接受。需更小体积时改 render_video
-的 crf（23~26）或限定 `-b:v`，勿改 preset=ultrafast（2核环境速度优先）。
+**输出文件过大 / 比源视频大很多**
+现版本默认按「源视频码率 × 1.06」单遍 ABR 编码，成片体积应接近源视频。
+若仍偏大：① 确认 ffprobe 能读到源视频 bit_rate（个别容器读不到时会退回
+crf=22 模式，日志有提示）；② 传 `--crf` 可强制走 crf 模式（23~26 更小）。
+历史版本固定 crf=22 + ultrafast，对低码率录屏会导致体积翻倍——已修复。
+
+**macOS 相关**
+- 依赖安装不再自动执行 apt-get：缺 ffmpeg/ffprobe 时脚本会打印 brew 命令供手动执行。
+- Homebrew Python（PEP 668）下 pip 安装失败会自动重试 `--user`。
+- SRT 已改为无 BOM 的纯 UTF-8（BOM 会被 mov_text 混入第一条字幕，破坏软字幕流程）。
 
 ## 验证清单（每次交付前）
 

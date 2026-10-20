@@ -26,6 +26,7 @@ Subcommands:
 Designed for annual regulation-revision workflows: after minor edits, change
 project.json (or the SRT) and run `render` — no re-transcription needed.
 """
+
 import argparse
 import difflib
 import importlib.util
@@ -41,7 +42,8 @@ import urllib.request
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DESCRIBE = os.path.normpath(
-    os.path.join(SKILL_DIR, "..", "media-read", "scripts", "describe.py"))
+    os.path.join(SKILL_DIR, "..", "media-read", "scripts", "describe.py")
+)
 # Cross-host adaptation: the original sandbox's Omni gateway (media-read
 # describe.py) only exists there. Elsewhere we fall back to env vars:
 #   SUBTITLE_API_BASE / SUBTITLE_API_KEY  -> OpenAI-compatible endpoint
@@ -51,8 +53,8 @@ ASR_BACKEND = os.environ.get("SUBTITLE_ASR_BACKEND", "auto")  # auto|qwen-omni|a
 # model size or local dir (set SUBTITLE_WHISPER_MODEL to a local path when
 # huggingface downloads are blocked; see references/host-adaptation.md)
 DEFAULT_WHISPER = os.environ.get("SUBTITLE_WHISPER_MODEL", "base")
-CHUNK_TARGET_S = 8 * 60           # target part length (describe.py cap: 20 min)
-MAX_CHARS_PER_LINE = 30           # Chinese chars before splitting a cue
+CHUNK_TARGET_S = 8 * 60  # target part length (describe.py cap: 20 min)
+MAX_CHARS_PER_LINE = 30  # Chinese chars before splitting a cue
 TRANSLATE_BATCH = 22
 MODEL_TRANSLATE = os.environ.get("SUBTITLE_MODEL_TEXT", "qwen3.7-plus")
 MODEL_OMNI = os.environ.get("SUBTITLE_MODEL_OMNI", "")
@@ -110,24 +112,32 @@ def nlen(t):
 # === STAGE: environment =====================================================
 
 IS_WINDOWS = os.name == "nt"
+IS_MACOS = sys.platform == "darwin"
+
+
+def _pkg_install_hint(tool):
+    if IS_MACOS:
+        return f"brew install {tool}   (or download a static build)"
+    return f"sudo apt-get install -y {tool}"
 
 
 def ensure_env():
-    """Check/install runtime dependencies. Idempotent."""
+    """Check/install runtime dependencies. Never auto-installs system
+    packages — prints the platform-appropriate command and exits instead
+    (macOS has no apt; silent sudo prompts broke unattended runs)."""
     # ffmpeg / ffprobe
     for tool in ("ffmpeg", "ffprobe"):
         if shutil.which(tool):
             continue
-        if IS_WINDOWS:
-            sys.exit(f"error: {tool} not on PATH — install it or add to PATH")
-        log(f"{tool} not found — installing via apt")
-        r = subprocess.run(["apt-get", "install", "-y", tool],
-                           capture_output=True)
-        if r.returncode != 0:
-            subprocess.run(["sudo", "apt-get", "install", "-y", tool], check=True)
+        sys.exit(
+            f"error: {tool} not on PATH — install it first: " + _pkg_install_hint(tool)
+        )
     # python packages
-    need = {"faster_whisper": "faster-whisper", "pypinyin": "pypinyin",
-            "docx": "python-docx"}
+    need = {
+        "faster_whisper": "faster-whisper",
+        "pypinyin": "pypinyin",
+        "docx": "python-docx",
+    }
     missing = []
     for mod, pkg in need.items():
         try:
@@ -136,25 +146,54 @@ def ensure_env():
             missing.append(pkg)
     if missing:
         log("pip installing: " + ", ".join(missing))
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q"] + missing,
-                       check=True)
-    # CJK font for ASS rendering
+        cmd = [sys.executable, "-m", "pip", "install", "-q"] + missing
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 and "--user" not in cmd:
+            # PEP 668 (Homebrew/system python on macOS, distro python on
+            # Linux): retry with --user before giving up
+            log("pip failed (externally-managed env?) — retrying with --user")
+            subprocess.run(cmd + ["--user"], check=True)
+    # CJK font for ASS rendering (existence check only, per-platform paths)
     if IS_WINDOWS:
-        fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
-        has_cjk = any(os.path.exists(os.path.join(fonts, f))
-                      for f in ("msyh.ttc", "simhei.ttf", "simsun.ttc"))
-        if not has_cjk:
-            sys.exit("error: no CJK font found in Windows\\Fonts")
+        fonts = [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")]
+    elif IS_MACOS:
+        fonts = [
+            "/System/Library/Fonts",
+            "/Library/Fonts",
+            os.path.expanduser("~/Library/Fonts"),
+        ]
     else:
-        r = subprocess.run(["bash", "-c", "fc-list | grep -ci cjk"],
-                           capture_output=True, text=True)
-        if r.stdout.strip() in ("", "0"):
-            log("No CJK font found — installing fonts-noto-cjk")
-            rr = subprocess.run(["apt-get", "install", "-y", "fonts-noto-cjk"],
-                                capture_output=True)
-            if rr.returncode != 0:
-                subprocess.run(["sudo", "apt-get", "install", "-y", "fonts-noto-cjk"],
-                               check=True)
+        fonts = ["/usr/share/fonts", "/usr/local/share/fonts"]
+    cjk_pat = re.compile(
+        r"(yahei|pingfang|hei|song|cjk|noto sans sc|"
+        r"source han|wenquanyi|wqy|droid sans fallback)",
+        re.I,
+    )
+    found = False
+    for d in fonts:
+        for root, _, files in os.walk(d) if os.path.isdir(d) else []:
+            if any(cjk_pat.search(f) for f in files):
+                found = True
+                break
+        if found:
+            break
+    if not found and shutil.which("fc-list"):
+        r = subprocess.run(
+            ["bash", "-c", "fc-list | grep -icE 'cjk|hei|song|han' || true"],
+            capture_output=True,
+            text=True,
+        )
+        found = r.stdout.strip() not in ("", "0")
+    if not found:
+        sys.exit(
+            "error: no CJK font found — install one: "
+            + (
+                "(PingFang ships with macOS; brew install font-noto-sans-cjk-sc if missing)"
+                if IS_MACOS
+                else "sudo apt-get install -y fonts-noto-cjk"
+            )
+        )
+    globals()["_CJK_FONT"] = None  # resolved lazily by cjk_font_name()
     # ASR backend availability
     backend = ASR_BACKEND
     if backend == "auto":
@@ -173,8 +212,63 @@ def ensure_env():
 
 
 def cjk_font_name():
-    """Font name for ASS styles — platform dependent."""
-    return "Microsoft YaHei" if IS_WINDOWS else "Noto Sans CJK SC"
+    """Font family name for ASS styles, probed against installed fonts.
+    libass matches by family name, so a wrong guess silently renders tofu."""
+    cached = globals().get("_CJK_FONT")
+    if cached:
+        return cached
+    if IS_WINDOWS:
+        cand = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC"]
+        probe_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    elif IS_MACOS:
+        cand = [
+            "PingFang SC",
+            "Hiragino Sans GB",
+            "Noto Sans CJK SC",
+            "STHeiti",
+            "Arial Unicode MS",
+        ]
+        probe_dir = "/System/Library/Fonts"
+    else:
+        cand = [
+            "Noto Sans CJK SC",
+            "Source Han Sans SC",
+            "WenQuanYi Micro Hei",
+            "Droid Sans Fallback",
+        ]
+        probe_dir = "/usr/share/fonts"
+    # filename hints per candidate (cheap filesystem probe)
+    hints = {
+        "Microsoft YaHei": ["msyh"],
+        "SimHei": ["simhei"],
+        "PingFang SC": ["PingFang"],
+        "Hiragino Sans GB": ["HiraginoSansGB"],
+        "STHeiti": ["STHeiti", "Heiti"],
+        "Noto Sans CJK SC": ["NotoSansCJK", "NotoSansSC"],
+        "Source Han Sans SC": ["SourceHanSans", "NotoSansCJK"],
+        "WenQuanYi Micro Hei": ["wqy-microhei"],
+        "Droid Sans Fallback": ["DroidSansFallback"],
+    }
+    files = []
+    for root, _, fs in os.walk(probe_dir):
+        files.extend(f.lower() for f in fs)
+    listing = (
+        "\n".join(files)
+        if files
+        else subprocess.run(
+            ["bash", "-c", "fc-list 2>/dev/null | tr '[:upper:]' '[:lower:]'"],
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    for name in cand:
+        if any(h.lower() in listing for h in hints.get(name, [])):
+            globals()["_CJK_FONT"] = name
+            return name
+    fallback = cand[0]
+    log(f"font probe inconclusive — assuming {fallback}")
+    globals()["_CJK_FONT"] = fallback
+    return fallback
 
 
 def extract_doc(path):
@@ -182,6 +276,7 @@ def extract_doc(path):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".docx":
         import docx
+
         d = docx.Document(path)
         paras = [p.text.strip() for p in d.paragraphs if p.text.strip()]
         rows = []
@@ -197,26 +292,65 @@ def extract_doc(path):
 
 # === STAGE: setup (audio extract, silence cuts, parts) ======================
 
+
 def stage_setup(work, video, doc, chunk_s):
     meta_p = os.path.join(work, "meta.json")
     if stage_done(meta_p):
         log("setup: cached")
         return read_json(meta_p)
     assert os.path.exists(video), f"video not found: {video}"
-    dur = float(subprocess.check_output(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", video], text=True).strip())
+    dur = float(
+        subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                video,
+            ],
+            text=True,
+        ).strip()
+    )
     wav = os.path.join(work, "full_audio.wav")
     if not stage_done(wav):
         log("setup: extracting audio")
-        run(["ffmpeg", "-y", "-v", "error", "-i", video,
-             "-vn", "-ac", "1", "-ar", "16000", wav])
+        run(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                video,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                wav,
+            ]
+        )
     # silence points -> chunk boundaries near multiples of chunk_s
-    r = run(["ffmpeg", "-v", "info", "-i", wav,
-             "-af", "silencedetect=n=-35dB:d=0.45", "-f", "null", "-"],
-            capture_output=True, text=True)
-    sil = [float(x) for x in
-           re.findall(r"silence_start: ([0-9.]+)", r.stderr)]
+    r = run(
+        [
+            "ffmpeg",
+            "-v",
+            "info",
+            "-i",
+            wav,
+            "-af",
+            "silencedetect=n=-35dB:d=0.45",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    sil = [float(x) for x in re.findall(r"silence_start: ([0-9.]+)", r.stderr)]
     cuts = []
     t = chunk_s
     while t < dur - 60:
@@ -230,18 +364,44 @@ def stage_setup(work, video, doc, chunk_s):
         s, e = bounds[i], bounds[i + 1]
         p = os.path.join(work, f"part{i + 1}.m4a")
         if not stage_done(p):
-            run(["ffmpeg", "-y", "-v", "error", "-i", wav, "-ss", f"{s}",
-                 "-t", f"{e - s}", "-c:a", "aac", "-b:a", "64k",
-                 "-ar", "16000", "-ac", "1", p])
+            run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    wav,
+                    "-ss",
+                    f"{s}",
+                    "-t",
+                    f"{e - s}",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "64k",
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+                    p,
+                ]
+            )
         parts.append(p)
     doc_text = extract_doc(doc)
-    meta = {"video": os.path.abspath(video), "doc": os.path.abspath(doc),
-            "duration": dur, "bounds": bounds,
-            "parts": parts, "doc_chars": len(doc_text)}
+    meta = {
+        "video": os.path.abspath(video),
+        "doc": os.path.abspath(doc),
+        "duration": dur,
+        "bounds": bounds,
+        "parts": parts,
+        "doc_chars": len(doc_text),
+    }
     write_json(meta_p, meta)
     open(os.path.join(work, "doc.txt"), "w", encoding="utf-8").write(doc_text)
     log(f"setup: {len(parts)} parts, duration {dur:.0f}s")
     return meta
+
 
 # === STAGE: transcribe (Qwen3-Omni + document context) ======================
 
@@ -263,31 +423,63 @@ def _mimo_asr_call(audio_path, base_url, api_key, language="zh", tries=3):
     base64 <=10MB (~17min at 8k mono mp3), max output 4096 tokens.
     Returns transcript with native punctuation (may be one paragraph)."""
     import base64 as b64mod
+
     ext = os.path.splitext(audio_path)[1].lstrip(".").lower()
     if ext == "m4a":
         tmp = audio_path + ".mp3"
         if not stage_done(tmp):
-            run(["ffmpeg", "-y", "-v", "error", "-i", audio_path,
-                 "-ar", "16000", "-ac", "1", "-b:a", "32k", tmp])
+            run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    audio_path,
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+                    "-b:a",
+                    "32k",
+                    tmp,
+                ]
+            )
         audio_path, ext = tmp, "mp3"
     mime = {"wav": "audio/wav", "mp3": "audio/mpeg"}.get(ext)
     if not mime:
         sys.exit(f"mimo asr: unsupported format .{ext} (convert to wav/mp3 first)")
-    data = f"data:{mime};base64," + b64mod.b64encode(
-        open(audio_path, "rb").read()).decode()
-    body = {"model": MODEL_OMNI or "mimo-v2.5-asr", "max_tokens": 4096,
-            "messages": [{"role": "user", "content": [
-                {"type": "input_audio",
-                 "input_audio": {"data": data, "format": ext}}]}],
-            "asr_options": {"language": language}}
+    data = (
+        f"data:{mime};base64,"
+        + b64mod.b64encode(open(audio_path, "rb").read()).decode()
+    )
+    body = {
+        "model": MODEL_OMNI or "mimo-v2.5-asr",
+        "max_tokens": 4096,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": data, "format": ext},
+                    }
+                ],
+            }
+        ],
+        "asr_options": {"language": language},
+    }
     last = None
     for att in range(tries):
         try:
             req = urllib.request.Request(
                 f"{base_url}/chat/completions",
                 data=json.dumps(body).encode(),
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json"})
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
             d = json.loads(urllib.request.urlopen(req, timeout=900).read())
             return d["choices"][0]["message"]["content"]
         except Exception as e:  # noqa: BLE001
@@ -296,25 +488,39 @@ def _mimo_asr_call(audio_path, base_url, api_key, language="zh", tries=3):
     raise RuntimeError(f"mimo asr failed: {last}")
 
 
-def _api_audio_chat(audio_path, prompt, base_url, api_key, max_tokens=8192,
-                    tries=3):
+def _api_audio_chat(audio_path, prompt, base_url, api_key, max_tokens=8192, tries=3):
     """OpenAI-compatible audio transcription/chat with a local file."""
     import base64
+
     b64 = base64.b64encode(open(audio_path, "rb").read()).decode()
     ext = os.path.splitext(audio_path)[1].lstrip(".").lower() or "m4a"
-    body = {"model": MODEL_OMNI, "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "input_audio",
-                 "input_audio": {"data": f"data:;base64,{b64}", "format": ext}}]}]}
+    body = {
+        "model": MODEL_OMNI,
+        "max_tokens": max_tokens,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": f"data:;base64,{b64}", "format": ext},
+                    },
+                ],
+            }
+        ],
+    }
     last = None
     for att in range(tries):
         try:
             req = urllib.request.Request(
                 f"{base_url}/chat/completions",
                 data=json.dumps(body).encode(),
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json"})
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
             d = json.loads(urllib.request.urlopen(req, timeout=900).read())
             return d["choices"][0]["message"]["content"]
         except Exception as e:  # noqa: BLE001
@@ -340,31 +546,56 @@ def stage_transcribe(work, meta, force=False):
         # agent mode: the host agent reads parts_manifest.json, transcribes
         # each audio part itself (Read tool on the audio file), writes transN.txt,
         # then re-runs build — this stage becomes cached.
-        manifest = {"backend": "agent", "prompt_file": "trans_prompt.txt",
-                    "parts": [{"idx": i, "audio": os.path.abspath(p),
-                               "out": os.path.abspath(d)} for i, p, d in pending]}
+        manifest = {
+            "backend": "agent",
+            "prompt_file": "trans_prompt.txt",
+            "parts": [
+                {"idx": i, "audio": os.path.abspath(p), "out": os.path.abspath(d)}
+                for i, p, d in pending
+            ],
+        }
         write_json(os.path.join(work, "parts_manifest.json"), manifest)
-        log(f"transcribe: AGENT mode — {len(pending)} parts pending, "
-            f"see {os.path.join(work, 'parts_manifest.json')}")
+        log(
+            f"transcribe: AGENT mode — {len(pending)} parts pending, "
+            f"see {os.path.join(work, 'parts_manifest.json')}"
+        )
         sys.exit(3)  # signal: needs agent transcription, then re-run build
     if backend == "qwen-omni":
         for i, part, dst in pending:
             for attempt in range(3):
                 t0 = time.time()
                 r = subprocess.run(
-                    [sys.executable, DESCRIBE, "--audio", part, "--prompt", prompt,
-                     "--timeout", "900", "--max-tokens", "8192"],
-                    capture_output=True, text=True)
+                    [
+                        sys.executable,
+                        DESCRIBE,
+                        "--audio",
+                        part,
+                        "--prompt",
+                        prompt,
+                        "--timeout",
+                        "900",
+                        "--max-tokens",
+                        "8192",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
                 if r.returncode == 0 and len(r.stdout.strip()) > 50:
                     open(dst, "w", encoding="utf-8").write(r.stdout.strip() + "\n")
-                    log(f"transcribe: part {i}/{len(meta['parts'])} OK "
-                        f"({len(r.stdout)} chars, {time.time() - t0:.0f}s)")
+                    log(
+                        f"transcribe: part {i}/{len(meta['parts'])} OK "
+                        f"({len(r.stdout)} chars, {time.time() - t0:.0f}s)"
+                    )
                     break
-                log(f"transcribe: part {i} attempt {attempt + 1} failed: "
-                    f"{r.stderr[-200:].strip()}")
+                log(
+                    f"transcribe: part {i} attempt {attempt + 1} failed: "
+                    f"{r.stderr[-200:].strip()}"
+                )
                 time.sleep(5 * (attempt + 1))
             else:
-                sys.exit(f"transcribe part {i} failed after 3 attempts — rerun to resume")
+                sys.exit(
+                    f"transcribe part {i} failed after 3 attempts — rerun to resume"
+                )
         return
     # backend == "api": OpenAI-compatible endpoint. mimo-* models use the
     # dedicated MiMo ASR call shape (audio-only request, no prompt injection).
@@ -378,13 +609,16 @@ def stage_transcribe(work, meta, force=False):
             out = _api_audio_chat(part, prompt, base_url, api_key)
         if out and len(out.strip()) > 50:
             open(dst, "w", encoding="utf-8").write(out.strip() + "\n")
-            log(f"transcribe: part {i}/{len(meta['parts'])} OK "
-                f"({len(out)} chars, {time.time() - t0:.0f}s)")
+            log(
+                f"transcribe: part {i}/{len(meta['parts'])} OK "
+                f"({len(out)} chars, {time.time() - t0:.0f}s)"
+            )
         else:
             sys.exit(f"transcribe part {i}: empty output — rerun to resume")
 
 
 # === STAGE: timing (faster-whisper timestamps only) =========================
+
 
 def stage_timing(work, meta, hot_prompt="", force=False):
     out_p = os.path.join(work, "whisper_segments.json")
@@ -392,34 +626,48 @@ def stage_timing(work, meta, hot_prompt="", force=False):
         log("timing: cached")
         return
     from faster_whisper import WhisperModel
+
     model = WhisperModel(DEFAULT_WHISPER, device="cpu", compute_type="int8")
     log("timing: whisper model loaded")
     all_segs = []
     for i, part in enumerate(meta["parts"], 1):
         t0 = time.time()
         segments, _ = model.transcribe(
-            part, language="zh", beam_size=1, vad_filter=True,
+            part,
+            language="zh",
+            beam_size=1,
+            vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 450},
-            initial_prompt=hot_prompt or None)
+            initial_prompt=hot_prompt or None,
+        )
         off = meta["bounds"][i - 1]
         cnt = 0
         for s in segments:
-            all_segs.append({"start": round(s.start + off, 2),
-                             "end": round(s.end + off, 2),
-                             "text": s.text.strip()})
+            all_segs.append(
+                {
+                    "start": round(s.start + off, 2),
+                    "end": round(s.end + off, 2),
+                    "text": s.text.strip(),
+                }
+            )
             cnt += 1
-        log(f"timing: part {i}/{len(meta['parts'])} {cnt} segs "
-            f"({time.time() - t0:.0f}s)")
+        log(
+            f"timing: part {i}/{len(meta['parts'])} {cnt} segs "
+            f"({time.time() - t0:.0f}s)"
+        )
     write_json(out_p, all_segs)
     log(f"timing: total {len(all_segs)} segments")
+
 
 # === STAGE: align (pinyin global alignment) =================================
 # Whisper's Chinese text is unreliable, but its timestamps are good. Omni's
 # text is accurate but untimestamped. Align them via pinyin strings so that
 # homophone errors (the dominant whisper error type in Chinese) still match.
 
+
 def _pinyin(s):
     from pypinyin import lazy_pinyin
+
     return "".join(lazy_pinyin(s))
 
 
@@ -428,11 +676,22 @@ def _restore_punctuation(text):
     Returns original text on any failure (caller falls back to space splitting)."""
     try:
         base_url, api_key = _resolve_endpoint()
-        out = _text_chat(("下面是一段没有标点的中文语音转写稿。请在不增删改任何文字的前提下，"
-                          "加上正确的标点符号（逗号、句号、问号等），并按句子分成多行输出。"
-                          "只输出处理后的文本。\n\n" + text),
-                         base_url, api_key, max_tokens=7000, tries=3)
-        if 0.7 * max(1, len(norm(text))) <= len(norm(out)) <= 1.35 * max(1, len(norm(text))):
+        out = _text_chat(
+            (
+                "下面是一段没有标点的中文语音转写稿。请在不增删改任何文字的前提下，"
+                "加上正确的标点符号（逗号、句号、问号等），并按句子分成多行输出。"
+                "只输出处理后的文本。\n\n" + text
+            ),
+            base_url,
+            api_key,
+            max_tokens=7000,
+            tries=3,
+        )
+        if (
+            0.7 * max(1, len(norm(text)))
+            <= len(norm(out))
+            <= 1.35 * max(1, len(norm(text)))
+        ):
             return out
     except Exception:  # noqa: BLE001
         pass
@@ -511,8 +770,9 @@ def stage_align(work, meta, force=False):
             A_ranges.append((pos, pos + len(p), t))
             pos += len(p)
         A = "".join(A_parts)
-        blocks = difflib.SequenceMatcher(None, A, B,
-                                         autojunk=False).get_matching_blocks()
+        blocks = difflib.SequenceMatcher(
+            None, A, B, autojunk=False
+        ).get_matching_blocks()
 
         def map_a_to_b(p_a):
             for a, b, sz in blocks:
@@ -538,7 +798,9 @@ def stage_align(work, meta, force=False):
                 if c0 <= p_b <= c1:
                     if c1 == c0:
                         return seg["start"]
-                    return seg["start"] + (seg["end"] - seg["start"]) * (p_b - c0) / (c1 - c0)
+                    return seg["start"] + (seg["end"] - seg["start"]) * (p_b - c0) / (
+                        c1 - c0
+                    )
             return None
 
         for a0, a1, txt in A_ranges:
@@ -548,11 +810,19 @@ def stage_align(work, meta, force=False):
                 ts = t0_
             if te is None or te <= ts:
                 te = (ts or t0_) + 0.6
-            matched = sum(min(a1, a + sz) - max(a0, a) for a, b, sz in blocks
-                          if not (a + sz <= a0 or a >= a1) and sz > 0)
-            res.append({"text": txt, "start": max(t0_, ts),
-                        "end": min(t1_ + 5, te),
-                        "qual": round(matched / max(1, a1 - a0), 3)})
+            matched = sum(
+                min(a1, a + sz) - max(a0, a)
+                for a, b, sz in blocks
+                if not (a + sz <= a0 or a >= a1) and sz > 0
+            )
+            res.append(
+                {
+                    "text": txt,
+                    "start": max(t0_, ts),
+                    "end": min(t1_ + 5, te),
+                    "qual": round(matched / max(1, a1 - a0), 3),
+                }
+            )
     for idx, r in enumerate(res):
         if idx and r["start"] < res[idx - 1]["end"]:
             r["start"] = res[idx - 1]["end"]
@@ -561,11 +831,14 @@ def stage_align(work, meta, force=False):
         r["start"], r["end"] = round(r["start"], 2), round(r["end"], 2)
     write_json(out_p, res)
     q = [r["qual"] for r in res]
-    log(f"align: {len(res)} lines, qual mean={statistics.mean(q):.2f}, "
-        f"low(<0.5)={sum(1 for x in q if x < 0.5)}")
+    log(
+        f"align: {len(res)} lines, qual mean={statistics.mean(q):.2f}, "
+        f"low(<0.5)={sum(1 for x in q if x < 0.5)}"
+    )
 
 
 # === STAGE: clean (fillers, merge, split) ===================================
+
 
 def _cleanup(t):
     t = t.strip()
@@ -583,8 +856,18 @@ def _cleanup(t):
     return t
 
 
-_YEAR = {"零": "0", "一": "1", "二": "2", "三": "3", "四": "4",
-         "五": "5", "六": "6", "七": "7", "八": "8", "九": "9"}
+_YEAR = {
+    "零": "0",
+    "一": "1",
+    "二": "2",
+    "三": "3",
+    "四": "4",
+    "五": "5",
+    "六": "6",
+    "七": "7",
+    "八": "8",
+    "九": "9",
+}
 
 
 def stage_clean(work, meta, force=False):
@@ -623,31 +906,49 @@ def stage_clean(work, meta, force=False):
         split1.append({"zh": b, "start": tm, "end": s["end"]})
     # merge tight fragments into one cue
     merged = []
-    for l in split1:
+    for ln in split1:
         if merged:
             p = merged[-1]
-            if (l["start"] - p["end"] <= 0.18
-                    and nlen(p["zh"]) + nlen(l["zh"]) <= MAX_CHARS_PER_LINE - 2
-                    and l["end"] - p["start"] <= 8):
-                p["zh"] = (p["zh"].rstrip("，。、 ") + "，" + l["zh"].lstrip("，、 ")
-                           if nlen(p["zh"]) < 6 else p["zh"] + l["zh"])
-                p["end"] = l["end"]
+            if (
+                ln["start"] - p["end"] <= 0.18
+                and nlen(p["zh"]) + nlen(ln["zh"]) <= MAX_CHARS_PER_LINE - 2
+                and ln["end"] - p["start"] <= 8
+            ):
+                p["zh"] = (
+                    p["zh"].rstrip("，。、 ") + "，" + ln["zh"].lstrip("，、 ")
+                    if nlen(p["zh"]) < 6
+                    else p["zh"] + ln["zh"]
+                )
+                p["end"] = ln["end"]
                 continue
-        merged.append(dict(l))
+        merged.append(dict(ln))
     dur = meta["duration"]
-    for i, l in enumerate(merged):
+    for i, ln in enumerate(merged):
         # normalize 二零XX年 -> 20XX年
-        l["zh"] = re.sub(r"二零([零一二三四五六七八九]{2})年",
-                         lambda m: "20" + "".join(_YEAR[c] for c in m.group(1)) + "年",
-                         l["zh"])
-        l["idx"] = i
+        ln["zh"] = re.sub(
+            r"二零([零一二三四五六七八九]{2})年",
+            lambda m: "20" + "".join(_YEAR[c] for c in m.group(1)) + "年",
+            ln["zh"],
+        )
+        ln["idx"] = i
         nxt = merged[i + 1]["start"] if i + 1 < len(merged) else dur
-        if l["end"] - l["start"] < 0.8:
-            l["end"] = min(l["start"] + 0.8, nxt)
+        if ln["end"] - ln["start"] < 0.8:
+            ln["end"] = min(ln["start"] + 0.8, nxt)
     write_json(out_p, merged)
+    # transcript quality warning: whisper-bridge backend + no terminology
+    # proofreading is the top source of wrong characters (field report)
+    if globals().get("_RESOLVED_BACKEND") == "agent":
+        log(
+            "clean: ⚠ transcript came from local whisper — homophone errors "
+            "are expected. Proofread zh against the reference document before "
+            "delivery (see SKILL.md 校对步骤), or configure an api ASR backend "
+            "(SUBTITLE_ASR_BACKEND=api; e.g. mimo-v2.5-asr ≈ zero CJK errors)."
+        )
     log(f"clean: {len(merged)} subtitle cues")
 
+
 # === STAGE: translate (glossary-based, batched) =============================
+
 
 def _resolve_endpoint():
     return resolve_api()
@@ -655,20 +956,28 @@ def _resolve_endpoint():
 
 def _text_chat(prompt, base_url, api_key, max_tokens=7000, tries=4):
     if base_url is None:
-        raise RuntimeError("no text-chat endpoint configured "
-                           "(set SUBTITLE_API_BASE / SUBTITLE_API_KEY)")
-    body = {"model": MODEL_TRANSLATE,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens, "temperature": 0.2}
+        raise RuntimeError(
+            "no text-chat endpoint configured "
+            "(set SUBTITLE_API_BASE / SUBTITLE_API_KEY)"
+        )
+    body = {
+        "model": MODEL_TRANSLATE,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+    }
     last = None
     for att in range(tries):
         try:
             req = urllib.request.Request(
                 f"{base_url}/chat/completions",
                 data=json.dumps(body).encode(),
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json",
-                         "User-Agent": "media-describe/1.0"})
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "media-describe/1.0",
+                },
+            )
             d = json.loads(urllib.request.urlopen(req, timeout=180).read())
             return d["choices"][0]["message"]["content"]
         except Exception as e:  # noqa: BLE001
@@ -681,7 +990,7 @@ def _text_chat(prompt, base_url, api_key, max_tokens=7000, tries=4):
 def stage_translate(work, glossary, force=False):
     lines_p = os.path.join(work, "zh_lines.json")
     lines = read_json(lines_p)
-    todo = [l for l in lines if force or not l.get("en")]
+    todo = [ln for ln in lines if force or not ln.get("en")]
     if not todo:
         log("translate: cached")
         return
@@ -689,45 +998,60 @@ def stage_translate(work, glossary, force=False):
     if base_url is None:
         # agent mode: dump pending lines; the main agent translates
         # them into zh_lines.json ("en" field) then re-runs build.
-        manifest = {"backend": "agent", "glossary": glossary or "",
-                    "lines_file": os.path.abspath(lines_p),
-                    "pending_idx": [l["idx"] for l in todo]}
+        manifest = {
+            "backend": "agent",
+            "glossary": glossary or "",
+            "lines_file": os.path.abspath(lines_p),
+            "pending_idx": [ln["idx"] for ln in todo],
+        }
         write_json(os.path.join(work, "translate_manifest.json"), manifest)
-        log(f"translate: AGENT mode — {len(todo)} lines pending, "
-            f"see {os.path.join(work, 'translate_manifest.json')}")
+        log(
+            f"translate: AGENT mode — {len(todo)} lines pending, "
+            f"see {os.path.join(work, 'translate_manifest.json')}"
+        )
         sys.exit(3)
-    gl = open(glossary, encoding="utf-8").read() if glossary and os.path.exists(glossary) else ""
+    gl = (
+        open(glossary, encoding="utf-8").read()
+        if glossary and os.path.exists(glossary)
+        else ""
+    )
     if not gl:
         gl = "（无专用术语表，请按通用软件工程术语准确翻译）"
-    done_idx = {l["idx"] for l in lines if l.get("en")}
+    done_idx = {ln["idx"] for ln in lines if ln.get("en")}
     for b in range(0, len(todo), TRANSLATE_BATCH):
-        chunk = todo[b:b + TRANSLATE_BATCH]
-        numbered = "\n".join(f"{l['idx']}. {l['zh']}" for l in chunk)
-        prompt = (f"把下面编号的中文培训字幕逐句翻译成英文。这是企业内部培训，"
-                  f"口语风格但需专业准确。\n要求：每行输出格式为 \"编号. 英文译文\"，"
-                  f"不要加引号、不要解释、不要遗漏任何编号。\n"
-                  f"术语对照表（必须严格遵守）：\n{gl}\n\n"
-                  f"字幕行（按顺序翻译，口语化表达可适度整理为通顺英文，但不得增删语义）：\n{numbered}")
+        chunk = todo[b : b + TRANSLATE_BATCH]
+        numbered = "\n".join(f"{ln['idx']}. {ln['zh']}" for ln in chunk)
+        prompt = (
+            f"把下面编号的中文培训字幕逐句翻译成英文。这是企业内部培训，"
+            f'口语风格但需专业准确。\n要求：每行输出格式为 "编号. 英文译文"，'
+            f"不要加引号、不要解释、不要遗漏任何编号。\n"
+            f"术语对照表（必须严格遵守）：\n{gl}\n\n"
+            f"字幕行（按顺序翻译，口语化表达可适度整理为通顺英文，但不得增删语义）：\n{numbered}"
+        )
         out = _text_chat(prompt, base_url, api_key)
         trans = {}
         for ln in out.splitlines():
             mm = re.match(r"^\s*(\d+)[.、．]\s*(.+)$", ln.strip())
             if mm:
                 trans[int(mm.group(1))] = mm.group(2).strip()
-        for l in chunk:  # retry any missing line individually
-            if l["idx"] not in trans:
-                log(f"translate: line {l['idx']} missing, retrying solo")
-                trans[l["idx"]] = _text_chat(
-                    f"把这句中文培训字幕翻译成英文，只输出译文：{l['zh']}\n\n术语对照表：\n{gl}",
-                    base_url, api_key, max_tokens=500).strip()
-        for l in chunk:
-            l["en"] = trans[l["idx"]]
-        done_idx.update(l["idx"] for l in chunk)
+        for ln in chunk:  # retry any missing line individually
+            if ln["idx"] not in trans:
+                log(f"translate: line {ln['idx']} missing, retrying solo")
+                trans[ln["idx"]] = _text_chat(
+                    f"把这句中文培训字幕翻译成英文，只输出译文：{ln['zh']}\n\n术语对照表：\n{gl}",
+                    base_url,
+                    api_key,
+                    max_tokens=500,
+                ).strip()
+        for ln in chunk:
+            ln["en"] = trans[ln["idx"]]
+        done_idx.update(ln["idx"] for ln in chunk)
         write_json(lines_p, lines)  # checkpoint every batch -> resumable
         log(f"translate: {len(done_idx)}/{len(lines)} lines done")
 
 
 # === STAGE: package (project.json / SRT / ASS) ==============================
+
 
 def _ts_srt(t):
     h, rem = divmod(t, 3600)
@@ -759,34 +1083,66 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def write_subtitles(lines, srt_path, ass_path, width=1920, height=1080):
-    with open(srt_path, "w", encoding="utf-8-sig") as f:
-        for i, l in enumerate(lines, 1):
-            f.write(f"{i}\n{_ts_srt(l['start'])} --> {_ts_srt(l['end'])}\n"
-                    f"{l['zh']}\n{l['en']}\n\n")
+    # plain UTF-8 (no BOM): ffmpeg's mov_text embeds the BOM bytes into the
+    # first subtitle frame when muxing — breaks soft-sub workflows on macOS
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, ln in enumerate(lines, 1):
+            f.write(
+                f"{i}\n{_ts_srt(ln['start'])} --> {_ts_srt(ln['end'])}\n"
+                f"{ln['zh']}\n{ln['en']}\n\n"
+            )
     scale = height / 1080
-    esc = lambda s: s.replace("\\", "\\\\").replace("{", "(").replace("}", ")")
+
+    def esc(s):
+        return s.replace("\\", "\\\\").replace("{", "(").replace("}", ")")
+
     with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(ASS_HEAD.format(w=width, h=height, font=cjk_font_name(),
-                                cn=int(42 * scale),
-                                en=int(29 * scale), cnv=int(97 * scale),
-                                env=int(26 * scale)))
-        for l in lines:
-            txt = f"{esc(l['zh'])}\\N{{\\rEN}}{esc(l['en'])}"
-            f.write(f"Dialogue: 0,{_ts_ass(l['start'])},{_ts_ass(l['end'])},"
-                    f"CN,,0,0,0,,{txt}\n")
+        f.write(
+            ASS_HEAD.format(
+                w=width,
+                h=height,
+                font=cjk_font_name(),
+                cn=int(42 * scale),
+                en=int(29 * scale),
+                cnv=int(97 * scale),
+                env=int(26 * scale),
+            )
+        )
+        for ln in lines:
+            txt = f"{esc(ln['zh'])}\\N{{\\rEN}}{esc(ln['en'])}"
+            f.write(
+                f"Dialogue: 0,{_ts_ass(ln['start'])},{_ts_ass(ln['end'])},"
+                f"CN,,0,0,0,,{txt}\n"
+            )
 
 
 def stage_package(work, meta, name, outdir, glossary):
     lines = read_json(os.path.join(work, "zh_lines.json"))
-    missing = [l["idx"] for l in lines if not l.get("en")]
+    missing = [ln["idx"] for ln in lines if not ln.get("en")]
     if missing:
-        sys.exit(f"package: {len(missing)} lines lack translation — run translate first")
-    project = {"meta": {"name": name, "source_video": meta["video"],
-                        "doc": meta["doc"], "duration": meta["duration"],
-                        "glossary": glossary, "created": time.strftime("%Y-%m-%d %H:%M")},
-               "lines": [{"idx": l["idx"], "start": round(l["start"], 2),
-                          "end": round(l["end"], 2), "zh": l["zh"], "en": l["en"]}
-                         for l in lines]}
+        sys.exit(
+            f"package: {len(missing)} lines lack translation — run translate first"
+        )
+    project = {
+        "meta": {
+            "name": name,
+            "source_video": meta["video"],
+            "doc": meta["doc"],
+            "duration": meta["duration"],
+            "glossary": glossary,
+            "created": time.strftime("%Y-%m-%d %H:%M"),
+        },
+        "lines": [
+            {
+                "idx": ln["idx"],
+                "start": round(ln["start"], 2),
+                "end": round(ln["end"], 2),
+                "zh": ln["zh"],
+                "en": ln["en"],
+            }
+            for ln in lines
+        ],
+    }
     os.makedirs(outdir, exist_ok=True)
     proj_p = os.path.join(outdir, f"{name}_字幕工程.json")
     srt_p = os.path.join(outdir, f"{name}_中英双语字幕.srt")
@@ -796,29 +1152,85 @@ def stage_package(work, meta, name, outdir, glossary):
     log(f"package: project={proj_p} srt={srt_p} ({len(lines)} cues)")
     return proj_p, ass_p
 
+
 # === STAGE: render (ffmpeg burn-in) =========================================
+
 
 def _video_wh(video):
     out = subprocess.check_output(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "csv=p=0", video],
-        text=True).strip()
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            video,
+        ],
+        text=True,
+    ).strip()
     w, h = out.split(",")
     return int(w), int(h)
 
 
-def render_video(video, ass_path, out_path, preview_s=0, crf=22, preset="ultrafast"):
+def _video_bitrate(video):
+    out = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=bit_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            video,
+        ],
+        text=True,
+    ).strip()
+    try:
+        br = int(out)
+        return br if br > 0 else None
+    except ValueError:
+        return None  # container-level estimate fallback
+
+
+def render_video(video, ass_path, out_path, preview_s=0, crf=None, preset="veryfast"):
     """Burn ASS subtitles into video. preview_s>0 renders only the head clip.
 
-    The ass/libass filters in this ffmpeg build mis-parse Windows paths that
-    contain a drive-letter colon or non-ASCII chars, so run ffmpeg with cwd
-    set to the ASS file's directory and pass it as a relative filename.
+    Bitrate policy: target ≈ source video bitrate × 1.06 (one-pass ABR), so
+    output size stays close to the input. CRF mode is only a fallback when
+    the source bitrate cannot be probed — re-encoding a low-bitrate screen
+    recording at crf 22 can DOUBLE the file size (field report).
+    preset default raised ultrafast→veryfast (~3-5% smaller for similar speed;
+    x264 ultrafast is notorious for inflating bitrate).
+
+    The ass/libass filters in some Windows ffmpeg builds mis-parse paths with
+    a drive-letter colon or non-ASCII chars, so run ffmpeg with cwd set to the
+    ASS file's directory and pass it as a relative filename.
     """
     ass_dir = os.path.dirname(os.path.abspath(ass_path))
     ass_rel = os.path.basename(ass_path)
-    base_cmd = ["ffmpeg", "-y", "-v", "error", "-i", video,
-                "-vf", f"ass={ass_rel}", "-c:v", "libx264",
-                "-preset", preset, "-crf", str(crf), "-c:a", "copy"]
+    enc = ["-c:v", "libx264", "-preset", preset]
+    src_br = _video_bitrate(video)
+    if src_br and not crf:
+        enc += ["-b:v", str(int(src_br * 1.06))]
+        log(
+            f"render: targeting bitrate {int(src_br * 1.06 / 1000)}kbps "
+            f"(source {src_br // 1000}kbps)"
+        )
+    else:
+        enc += ["-crf", str(crf or 22)]
+        log("render: source bitrate unknown — falling back to crf mode")
+    base_cmd = (
+        ["ffmpeg", "-y", "-v", "error", "-i", video, "-vf", f"ass={ass_rel}"]
+        + enc
+        + ["-c:a", "copy"]
+    )
     kw = {"cwd": ass_dir}
     if preview_s > 0:
         base_cmd[2:2] = ["-t", str(preview_s)]
@@ -832,6 +1244,7 @@ def render_video(video, ass_path, out_path, preview_s=0, crf=22, preset="ultrafa
 
 
 # === split (theme/role-based short clips) ===================================
+
 
 def cmd_split(args):
     """Cut video into named short clips per a chapter plan (JSON).
@@ -849,9 +1262,21 @@ def cmd_split(args):
         sys.exit("split: video not found (pass --video or set plan.video)")
     base = plan.get("base") or os.path.splitext(os.path.basename(video))[0]
     lead_in = float(plan.get("lead_in", 0.35))
-    dur = float(subprocess.check_output(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", video], text=True).strip())
+    dur = float(
+        subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                video,
+            ],
+            text=True,
+        ).strip()
+    )
     outdir = os.path.join(args.out, f"{base}_拆分视频")
     os.makedirs(outdir, exist_ok=True)
     index = []
@@ -868,25 +1293,52 @@ def cmd_split(args):
         else:
             if e - s > 15 * 60:
                 log(f"split {i}: WARNING clip {e - s:.0f}s exceeds 15 min")
-            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.3f}", "-i", video,
-                 "-t", f"{e - s:.3f}",
-                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
-                 "-c:a", "aac", "-b:a", "128k", outp])
-            log(f"split {i}/{len(plan['chapters'])}: {os.path.basename(outp)} "
-                f"({e - s:.0f}s)")
-        index.append({"file": os.path.basename(outp),
-                      "range": f"{_ts_srt(ch['start'])[:8]} - {_ts_srt(ch['end'])[:8]}",
-                      "duration_s": round(e - ch["start"], 1),
-                      "title": ch.get("note", title)})
+            src_br = _video_bitrate(video)
+            enc = ["-b:v", str(int(src_br * 1.06))] if src_br else ["-crf", "22"]
+            run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-v",
+                    "error",
+                    "-ss",
+                    f"{s:.3f}",
+                    "-i",
+                    video,
+                    "-t",
+                    f"{e - s:.3f}",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                ]
+                + enc
+                + ["-c:a", "aac", "-b:a", "128k", outp]
+            )
+            log(
+                f"split {i}/{len(plan['chapters'])}: {os.path.basename(outp)} "
+                f"({e - s:.0f}s)"
+            )
+        index.append(
+            {
+                "file": os.path.basename(outp),
+                "range": f"{_ts_srt(ch['start'])[:8]} - {_ts_srt(ch['end'])[:8]}",
+                "duration_s": round(e - ch["start"], 1),
+                "title": ch.get("note", title),
+            }
+        )
     idx_p = os.path.join(outdir, "00_拆分目录.txt")
     with open(idx_p, "w", encoding="utf-8") as f:
         f.write(f"{base} 拆分目录（共 {len(index)} 集）\n" + "=" * 40 + "\n")
         for it in index:
-            f.write(f"{it['file']}\n    {it['range']}  时长 {it['duration_s']:.0f} 秒\n")
+            f.write(
+                f"{it['file']}\n    {it['range']}  时长 {it['duration_s']:.0f} 秒\n"
+            )
     log(f"split complete: {outdir}")
 
 
 # === subcommands ============================================================
+
 
 def cmd_build(args):
     ensure_env()
@@ -935,14 +1387,16 @@ def cmd_render(args):
     ensure_env()
     project = read_json(args.project)
     lines = project["lines"]
-    for l in lines:
-        if not l.get("en") or not l.get("zh"):
+    for ln in lines:
+        if not ln.get("en") or not ln.get("zh"):
             sys.exit("every line in project.json needs both zh and en")
     video = args.video or project["meta"].get("source_video")
     if not video or not os.path.exists(video):
         sys.exit("source video not found — pass --video")
     name = args.name or project["meta"].get("name", "video")
-    work = args.work or os.path.join(os.path.dirname(os.path.abspath(args.project)), "work")
+    work = args.work or os.path.join(
+        os.path.dirname(os.path.abspath(args.project)), "work"
+    )
     os.makedirs(work, exist_ok=True)
     ass_p = os.path.join(work, "subs.ass")
     outdir = args.out or os.path.dirname(os.path.abspath(args.project))
@@ -958,17 +1412,24 @@ def cmd_render(args):
 
 def cmd_status(args):
     w = args.work
-    stages = [("setup", "meta.json"), ("transcribe", "trans1.txt"),
-              ("timing", "whisper_segments.json"), ("align", "aligned.json"),
-              ("clean", "zh_lines.json")]
+    stages = [
+        ("setup", "meta.json"),
+        ("transcribe", "trans1.txt"),
+        ("timing", "whisper_segments.json"),
+        ("align", "aligned.json"),
+        ("clean", "zh_lines.json"),
+    ]
     for label, f in stages:
         p = os.path.join(w, f)
         if label == "transcribe":
             try:
                 meta = read_json(os.path.join(w, "meta.json"))
                 n = len(meta["parts"])
-                done = sum(1 for i in range(1, n + 1)
-                           if stage_done(os.path.join(w, f"trans{i}.txt")))
+                done = sum(
+                    1
+                    for i in range(1, n + 1)
+                    if stage_done(os.path.join(w, f"trans{i}.txt"))
+                )
                 print(f"transcribe: {done}/{n} parts")
                 continue
             except FileNotFoundError:
@@ -977,7 +1438,7 @@ def cmd_status(args):
     lines_p = os.path.join(w, "zh_lines.json")
     if stage_done(lines_p):
         lines = read_json(lines_p)
-        done = sum(1 for l in lines if l.get("en"))
+        done = sum(1 for ln in lines if ln.get("en"))
         print(f"translate : {done}/{len(lines)} lines")
 
 
@@ -987,18 +1448,37 @@ def main():
 
     b = sub.add_parser("build", help="run full pipeline (resumable)")
     b.add_argument("--video", required=True)
-    b.add_argument("--doc", required=True, help="reference regulation document (.docx/.txt/.md)")
+    b.add_argument(
+        "--doc", required=True, help="reference regulation document (.docx/.txt/.md)"
+    )
     b.add_argument("--out", required=True, help="output dir for deliverables")
-    b.add_argument("--work", required=True, help="working dir for intermediates (keep for revisions!)")
-    b.add_argument("--glossary", default="", help="term pairs file for translation (optional)")
-    b.add_argument("--hotwords", default="", help="comma-separated hotwords for whisper segmentation")
-    b.add_argument("--name", default="", help="base name for outputs (default: video filename)")
+    b.add_argument(
+        "--work",
+        required=True,
+        help="working dir for intermediates (keep for revisions!)",
+    )
+    b.add_argument(
+        "--glossary", default="", help="term pairs file for translation (optional)"
+    )
+    b.add_argument(
+        "--hotwords",
+        default="",
+        help="comma-separated hotwords for whisper segmentation",
+    )
+    b.add_argument(
+        "--name", default="", help="base name for outputs (default: video filename)"
+    )
     b.add_argument("--chunk-s", type=int, default=CHUNK_TARGET_S)
-    b.add_argument("--preview", type=int, default=90, help="preview clip seconds, 0 to skip")
+    b.add_argument(
+        "--preview", type=int, default=90, help="preview clip seconds, 0 to skip"
+    )
     b.add_argument("--skip-render", action="store_true")
-    b.add_argument("--stage", default="all",
-                   choices=["all", "transcribe", "timing", "align", "clean", "translate"],
-                   help="stop after this stage")
+    b.add_argument(
+        "--stage",
+        default="all",
+        choices=["all", "transcribe", "timing", "align", "clean", "translate"],
+        help="stop after this stage",
+    )
     b.add_argument("--force", action="store_true", help="redo cached stages")
     b.set_defaults(fn=cmd_build)
 
@@ -1006,16 +1486,22 @@ def main():
     r.add_argument("--project", required=True, help="字幕工程.json file")
     r.add_argument("--video", default="", help="override source video")
     r.add_argument("--out", default="", help="output dir (default: project dir)")
-    r.add_argument("--work", default="", help="working dir (default: <project dir>/work)")
+    r.add_argument(
+        "--work", default="", help="working dir (default: <project dir>/work)"
+    )
     r.add_argument("--name", default="")
-    r.add_argument("--srt-only", action="store_true", help="only regenerate SRT/ASS, skip video")
+    r.add_argument(
+        "--srt-only", action="store_true", help="only regenerate SRT/ASS, skip video"
+    )
     r.set_defaults(fn=cmd_render)
 
     s = sub.add_parser("status", help="show stage progress")
     s.add_argument("--work", required=True)
     s.set_defaults(fn=cmd_status)
 
-    sp = sub.add_parser("split", help="cut video into named short clips per chapter plan")
+    sp = sub.add_parser(
+        "split", help="cut video into named short clips per chapter plan"
+    )
     sp.add_argument("--plan", required=True, help="chapter plan JSON")
     sp.add_argument("--video", default="", help="video to split (overrides plan.video)")
     sp.add_argument("--out", required=True, help="output base dir")
@@ -1024,6 +1510,7 @@ def main():
 
     args = ap.parse_args()
     args.fn(args)
+
 
 if __name__ == "__main__":
     main()

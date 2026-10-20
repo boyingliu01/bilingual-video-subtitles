@@ -13,6 +13,7 @@ and skip this bridge entirely.
 Usage:
   python agent_transcribe.py --work <workdir> [--model base] [--hotwords a,b,c]
 """
+
 import argparse
 import json
 import os
@@ -37,19 +38,25 @@ def main():
     doc_p = os.path.join(args.work, "doc.txt")
     doc = open(doc_p, encoding="utf-8").read() if os.path.exists(doc_p) else ""
     # whisper initial_prompt biases vocabulary toward document terms
-    prompt_terms = ("，".join(args.hotwords.split(",")) if args.hotwords else "") \
-        or doc[:200]
+    prompt_terms = (
+        "，".join(args.hotwords.split(",")) if args.hotwords else ""
+    ) or doc[:200]
 
     from faster_whisper import WhisperModel
+
     model = WhisperModel(args.model, device="cpu", compute_type="int8")
     n = 0
     for part in manifest["parts"]:
         if os.path.exists(part["out"]) and os.path.getsize(part["out"]) > 0:
             continue
         segments, _ = model.transcribe(
-            part["audio"], language="zh", beam_size=1, vad_filter=True,
+            part["audio"],
+            language="zh",
+            beam_size=1,
+            vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 450},
-            initial_prompt=prompt_terms or None)
+            initial_prompt=prompt_terms or None,
+        )
         lines = [s.text.strip() for s in segments if s.text.strip()]
         with open(part["out"], "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
