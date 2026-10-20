@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=scripts"
+
+[tool.coverage.run]
+source = ["scripts"]
+relative_files = true
+omit = ["*/__pycache__/*"]
+
+[tool.coverage.report]
+fail_under = 0

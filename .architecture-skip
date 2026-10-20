@@ -1,0 +1,2 @@
+Flat two-script skill repo (scripts/pipeline.py + scripts/agent_transcribe.py).
+No layered architecture to validate; archlint layer constraints do not apply.

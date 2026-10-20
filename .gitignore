@@ -7,3 +7,4 @@ out/
 *.m4a
 *.mp3
 .env
+.xp-gate/
