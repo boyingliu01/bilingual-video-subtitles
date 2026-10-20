@@ -68,6 +68,11 @@ SUBTITLE_WHISPER_MODEL=base                        # 或本地 faster-whisper �
 - PyAV 需 <17（av 19 与 faster-whisper 不兼容）。
 - 更多见 [references/troubleshooting.md](references/troubleshooting.md)。
 
+## 版本
+
+当前版本 **v1.1.0**（2026-10-20）。变更记录见 [CHANGELOG.md](CHANGELOG.md)；
+历史版本通过 git tag 获取（`git tag -l` / GitHub Releases）。
+
 ## 致谢
 
 原始流水线诞生于某企业内部 AI 办公平台（Qwen3-Omni 驱动），2026-10 移植为宿主无关的通用版本，新增多后端转写、Windows 适配与 agent 挂起协议。

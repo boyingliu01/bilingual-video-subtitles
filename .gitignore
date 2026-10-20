@@ -8,3 +8,6 @@ out/
 *.mp3
 .env
 .xp-gate/
+.quality-history.jsonl
+.coverage
+coverage/

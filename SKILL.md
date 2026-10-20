@@ -1,5 +1,6 @@
 ---
 name: bilingual-video-subtitles
+version: 1.1.0
 description: 为培训/讲解视频自动添加中英文双语字幕（转写+翻译+硬字幕合成），并按主题/角色拆分成 10 分钟以内短视频。Use when 用户要求：给视频加中英字幕、培训视频双语字幕、视频转写并翻译英文字幕、外籍员工字幕支持、把培训视频按主题/角色/章节拆分成短视频、碎片化学习视频切分，或每年制度修订后对培训视频字幕做微调并重新渲染。核心能力：Qwen3-Omni 结合参考文档/制度文档做高精度中文转写（解决 whisper/funasr 专业术语识别差的问题），faster-whisper 提取时间轴，拼音全局对齐，术语表驱动的中译英，输出双语 SRT + 硬字幕视频 + 可编辑字幕工程文件（支持后续微调重渲染，无需重新转写）。命令：python3 scripts/pipeline.py build|render|split|status。
 ---
 
